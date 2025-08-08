@@ -42,12 +42,18 @@ def extract_mappings(excel_path: Path, l5x_path: Path, output_path: Path):
     tree   = etree.parse(str(l5x_path), parser)
     root   = tree.getroot()
 
-    # 3) Prepare COP/CPS regex
+    # 3) Prepare regexes
     cop_re = re.compile(
         r'\b(COP|CPS)\s*\(\s*'      # Instruction
         r'([^,\s\)]+)\s*,\s*'       # Source tag (with [idx])
         r'([^,\s\)]+)\s*,\s*'       # Dest tag (with [idx])
         r'(\d+)\s*\)',              # Length
+        re.IGNORECASE
+    )
+    mov_re = re.compile(            # MOV(Source, Destination)
+        r'\bMOV\s*\(\s*'
+        r'([^,\s\)]+)\s*,\s*'       # Source
+        r'([^,\s\)]+)\s*\)',
         re.IGNORECASE
     )
 
@@ -65,15 +71,17 @@ def extract_mappings(excel_path: Path, l5x_path: Path, output_path: Path):
         rout_name = rout.get("Name")
         rung_num  = rung.get("Number")
 
-        # 4a) COP / CPS in ladder text
         text_el = rung.find("Text")
         if text_el is not None and text_el.text:
-            for instr, src_full, dst_full, length_s in cop_re.findall(text_el.text):
+            txt = text_el.text
+
+            # 4a) COP / CPS with length expansion
+            for instr, src_full, dst_full, length_s in cop_re.findall(txt):
                 length = int(length_s)
 
-                def split_base(txt):
-                    m = re.match(r'^(.+?)\[(\d+)\]$', txt)
-                    return (m.group(1), int(m.group(2))) if m else (txt, 0)
+                def split_base(t):
+                    m = re.match(r'^(.+?)\[(\d+)\]$', t)
+                    return (m.group(1), int(m.group(2))) if m else (t, 0)
 
                 src_base, src_idx0 = split_base(src_full)
                 dst_base, dst_idx0 = split_base(dst_full)
@@ -92,7 +100,21 @@ def extract_mappings(excel_path: Path, l5x_path: Path, output_path: Path):
                         })
                         found.add(dst_i)
 
-        # 4b) MessageParameters in XML
+            # 4b) MOV (no length)
+            for src_full, dst_full in mov_re.findall(txt):
+                # exact match only (no expansion)
+                if dst_full in dest_tags:
+                    records.append({
+                        "Col45":       dst_full,
+                        "Program":     prog_name,
+                        "Routine":     rout_name,
+                        "Rung":        rung_num,
+                        "Instruction": "MOV",
+                        "Source":      src_full
+                    })
+                    found.add(dst_full)
+
+        # 4c) MessageParameters (XML)
         for mp in rung.findall(".//MessageParameters"):
             local_elem    = mp.get("LocalElement")
             req_len       = mp.get("RequestedLength")
