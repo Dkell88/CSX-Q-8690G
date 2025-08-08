@@ -2,10 +2,11 @@
 
 import re
 from pathlib import Path
+
 import pandas as pd
 from lxml import etree
 
-# —— Natural sort helpers (handles [idx] and .bit) ——
+# —— Natural sort helpers (handle [idx] and .bit) ——
 _tag_pat = re.compile(r'^(.*?)(?:\[(\d+)\])?(?:\.(\d+))?$')
 def tag_sort_key(tag: str):
     m = _tag_pat.match(tag or "")
@@ -34,7 +35,7 @@ def extract_mappings(excel_path: Path, l5x_path: Path, output_path: Path):
         if not p.exists() or not p.is_file():
             raise FileNotFoundError(f"{label} file not found or not a file: {p}")
 
-    # 1) Load Excel tags; keep a set for membership and a natural-sorted list for “Not Found” emission
+    # 1) Load Excel tags; keep both a set and a natural-sorted list
     df_tags = pd.read_excel(excel_path, engine="openpyxl")
     if "Col45" not in df_tags.columns:
         raise KeyError(f"'Col45' column not found. Available: {df_tags.columns.tolist()}")
@@ -46,13 +47,43 @@ def extract_mappings(excel_path: Path, l5x_path: Path, output_path: Path):
     tree   = etree.parse(str(l5x_path), parser)
     root   = tree.getroot()
 
-    # 3) Build a datatype map: base Tag Name -> DataType (e.g., INT, DINT)
+    # 3) Build maps: DataType, base Description, and bit comments from Tag definitions
     dtype_map = {}
+    base_desc_map = {}
+    bit_comment_map = {}   # key: "Base[idx].bit" -> comment text
+
     for t in root.findall(".//Tag"):
-        name = t.get("Name")
-        dt   = t.get("DataType")
-        if name and dt:
-            dtype_map[name] = dt.upper()
+        base_name = t.get("Name")
+        if not base_name:
+            continue
+
+        dt = (t.get("DataType") or "").upper()
+        if dt:
+            dtype_map[base_name] = dt
+
+        desc_el = t.find("Description")
+        if desc_el is not None:
+            base_desc = (desc_el.get("Text") or desc_el.text or "").strip()
+            if base_desc:
+                base_desc_map[base_name] = base_desc
+
+        # Gather bit-level comments under <Comments><Comment Operand="[i].bit">...</Comment>
+        comments_el = t.find("Comments")
+        if comments_el is not None:
+            for c in comments_el.findall("Comment"):
+                operand = (c.get("Operand") or "").strip()   # e.g. "[17].5" or "HMI_01[17].5"
+                if not operand:
+                    continue
+                text = (c.get("Text") or c.text or "").strip()
+                if not text:
+                    continue
+
+                # Normalize operand to include base name
+                if operand.startswith("["):
+                    key = f"{base_name}{operand}"            # -> "HMI_01[17].5"
+                else:
+                    key = operand                             # already fully qualified
+                bit_comment_map[key] = text
 
     # 4) Prepare regexes
     cop_re = re.compile(
@@ -68,15 +99,15 @@ def extract_mappings(excel_path: Path, l5x_path: Path, output_path: Path):
         r'([^,\s\)]+)\s*\)',        # Destination
         re.IGNORECASE
     )
-    ote_re = re.compile(
-        r'\bOTE\s*\(\s*([^\s\)]+)\s*\)',  # OTE(operand)
+    ote_text_re = re.compile(
+        r'\bOTE\s*\(\s*([^\s\)]+)\s*\)',  # OTE(operand) from rung text
         re.IGNORECASE
     )
 
-    # 5) Walk every Rung; collect direct mappings + index OTE operands for later bitwise lookups
+    # 5) Walk every Rung; collect direct mappings + OTE operand index (and rung-level bit comments if present)
     records = []
-    found_original_tags = set()  # items exactly as in Col45 (e.g., "X[7]") that we've mapped
-    ote_map = {}                 # operand -> list of (Program, Routine, Rung)
+    found_original_tags = set()   # items exactly as in Col45 (e.g., "X[7]") that we've mapped
+    ote_map = {}                  # operand -> list of (Program, Routine, Rung)
 
     for rung in root.findall(".//Rung"):
         # context
@@ -91,10 +122,22 @@ def extract_mappings(excel_path: Path, l5x_path: Path, output_path: Path):
         text_el = rung.find("Text")
         txt = text_el.text if (text_el is not None and text_el.text) else ""
 
-        # Index OTE operands for later bitwise search
-        for operand in ote_re.findall(txt):
+        # Track OTE operands present on this rung (for existence / context)
+        for operand in ote_text_re.findall(txt):
             operand = operand.strip()
-            ote_map.setdefault(operand, []).append((prog_name, rout_name, rung_num))
+            if operand:
+                ote_map.setdefault(operand, []).append((prog_name, rout_name, rung_num))
+
+        # Also scan structured rung XML for bit comments tied directly to operands (rare but possible)
+        for elem in rung.findall(".//*[@Operand]"):
+            operand = (elem.get("Operand") or "").strip()
+            if not operand:
+                continue
+            com = elem.find("Comment")
+            if com is not None:
+                ctext = (com.get("Text") or com.text or "").strip()
+                if ctext and operand not in bit_comment_map:  # don't override tag-level comments
+                    bit_comment_map[operand] = ctext
 
         # COP/CPS (expand by length)
         for instr, src_full, dst_full, length_s in cop_re.findall(txt):
@@ -102,6 +145,7 @@ def extract_mappings(excel_path: Path, l5x_path: Path, output_path: Path):
             src_base, src_i0 = split_index(src_full)
             dst_base, dst_i0 = split_index(dst_full)
             dt = dtype_map.get(dst_base, "")
+            base_desc = base_desc_map.get(dst_base, "")
 
             for k in range(length):
                 dst_k = f"{dst_base}[{dst_i0 + k}]"
@@ -109,6 +153,7 @@ def extract_mappings(excel_path: Path, l5x_path: Path, output_path: Path):
                     src_k = f"{src_base}[{src_i0 + k}]"
                     records.append({
                         "Col45":       dst_k,
+                        "Description": base_desc,   # base tag description
                         "DataType":    dt,
                         "Program":     prog_name,
                         "Routine":     rout_name,
@@ -123,8 +168,10 @@ def extract_mappings(excel_path: Path, l5x_path: Path, output_path: Path):
             if dst_full in dest_tags_set:
                 dst_base, _ = split_index(dst_full)
                 dt = dtype_map.get(dst_base, "")
+                base_desc = base_desc_map.get(dst_base, "")
                 records.append({
                     "Col45":       dst_full,
+                    "Description": base_desc,
                     "DataType":    dt,
                     "Program":     prog_name,
                     "Routine":     rout_name,
@@ -146,15 +193,14 @@ def extract_mappings(excel_path: Path, l5x_path: Path, output_path: Path):
             length      = int(req_len)
             local_index = int(local_index_s)
 
-            # destination base / idx
             m = re.match(r'^(.+?)\[(\d+)\]$', local_elem)
             if m:
                 dst_base, dst_i0 = m.group(1), int(m.group(2))
             else:
                 dst_base, dst_i0 = local_elem, local_index
             dt = dtype_map.get(dst_base, "")
+            base_desc = base_desc_map.get(dst_base, "")
 
-            # source base / idx (if present)
             m2 = re.match(r'^(.+?)\[(\d+)\]$', remote_elem or "")
             if m2:
                 src_base, src_i0 = m2.group(1), int(m2.group(2))
@@ -167,6 +213,7 @@ def extract_mappings(excel_path: Path, l5x_path: Path, output_path: Path):
                     src_k = f"{src_base}[{src_i0 + k}]"
                     records.append({
                         "Col45":       dst_k,
+                        "Description": base_desc,
                         "DataType":    dt,
                         "Program":     prog_name,
                         "Routine":     rout_name,
@@ -176,44 +223,57 @@ def extract_mappings(excel_path: Path, l5x_path: Path, output_path: Path):
                     })
                     found_original_tags.add(dst_k)
 
-    # 6) Bitwise OTE search for any tag with no direct mapping
+    # 6) Bitwise OTE sweep: only emit bits that actually have an OTE
     for orig in tags_sorted:
         if orig in found_original_tags:
-            continue  # direct mapping already found
+            continue  # already mapped directly by COP/CPS/MOV/Message
+
         base, idx = split_index(orig)
         dt = dtype_map.get(base, "")
         if dt not in ("INT", "DINT"):
-            continue  # cannot bit-scan unknown types
+            continue
 
-        max_bit = 15 if dt == "INT" else 31
-        any_bit_found = False
+        max_bit   = 15 if dt == "INT" else 31
+        base_desc = base_desc_map.get(base, "")
+        emitted   = False
 
         for bit in range(max_bit + 1):
             operand = f"{base}[{idx}].{bit}"
-            if operand in ote_map:
-                # Pick first context; (there could be multiple, but we keep one)
-                prog_name, rout_name, rung_num = ote_map[operand][0]
-                records.append({
-                    "Col45":       operand,
-                    "DataType":    dt,
-                    "Program":     prog_name,
-                    "Routine":     rout_name,
-                    "Rung":        rung_num,
-                    "Instruction": "OTE",
-                    "Source":      "",  # per your request
-                })
-                any_bit_found = True
+            ctx = ote_map.get(operand)
+            if not ctx:
+                continue  # skip bits without an actual OTE reference
 
-        if any_bit_found:
-            found_original_tags.add(orig)  # suppress "Not Found" for the parent
+            # Prefer tag-level bit comment; fallback to rung-level (if captured earlier) or base description
+            descr = bit_comment_map.get(operand, base_desc)
 
-    # 7) “Not Found” rows for anything never matched (directly or via OTE bits)
+            # Use first OTE occurrence for context (Program/Routine/Rung)
+            prog_name, rout_name, rung_num = ctx[0]
+
+            records.append({
+                "Col45":       operand,
+                "Description": descr,
+                "DataType":    dt,
+                "Program":     prog_name,
+                "Routine":     rout_name,
+                "Rung":        rung_num,
+                "Instruction": "OTE",
+                "Source":      "",
+            })
+            emitted = True
+
+        if emitted:
+            # We found at least one OTE-mapped bit for this element, so don't add "Not Found" later
+            found_original_tags.add(orig)
+
+    # 7) “Not Found” rows for anything never matched (direct or OTE sweep)
     for tag in tags_sorted:
         if tag not in found_original_tags:
             base, _ = split_index(tag)
             dt = dtype_map.get(base, "")
+            base_desc = base_desc_map.get(base, "")
             records.append({
                 "Col45":       tag,
+                "Description": base_desc,
                 "DataType":    dt,
                 "Program":     "",
                 "Routine":     "",
@@ -222,8 +282,8 @@ def extract_mappings(excel_path: Path, l5x_path: Path, output_path: Path):
                 "Source":      "",
             })
 
-    # 8) De-dup and natural-sort the entire output by Col45
-    cols  = ["Col45","DataType","Program","Routine","Rung","Instruction","Source"]
+    # 8) De-dup and natural-sort the entire output by Col45 (handles [i] and .bit)
+    cols  = ["Col45","Description","DataType","Program","Routine","Rung","Instruction","Source"]
     df_out = pd.DataFrame(records, columns=cols).drop_duplicates()
 
     tmp = df_out["Col45"].str.extract(r'^(.*?)(?:\[(\d+)\])?(?:\.(\d+))?$')
