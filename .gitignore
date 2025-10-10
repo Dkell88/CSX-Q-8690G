@@ -1,0 +1,3 @@
+# Ignore specific Excel files in the root directory
+/HMI Tag Format Example.xlsx
+/ww_TAG_crossref Example.xlsx

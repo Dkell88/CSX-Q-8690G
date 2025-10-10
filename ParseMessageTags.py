@@ -5,7 +5,7 @@ import pandas as pd
 
 # PARAMETERS you can tweak:
 INPUT_DIR = r"C:\Users\dkelly\QCA Systems Ltd\CSX Curtis Bay Pier - Documents\Q-8690G - Site Wide Ignition Deployment\05 ENG AUTO\10 Conceptual\Program Exports"
-OUTPUT_FILE = r"C:\Users\dkelly\Documents\message_summary.xlsx"
+OUTPUT_FILE = r"C:\Users\dkelly\QCA Systems Ltd\CSX Curtis Bay Pier - Documents\Q-8690G - Site Wide Ignition Deployment\05 ENG AUTO\10 Conceptual\PLC Message Summary Dump.xlsx"
 
 # The exact MessageParameters attributes you want to capture:
 PARAMS = [
